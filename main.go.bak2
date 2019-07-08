@@ -1,0 +1,174 @@
+package main
+
+import (
+	"flag"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/vys/go-humanize"
+)
+
+type Server struct {
+	proto   string
+	addr    string
+	handler func(c *net.TCPConn) error
+}
+
+func (s *Server) ListenAndGo() error {
+	tcpaddr, _ := net.ResolveTCPAddr(s.proto, s.addr)
+	ln, err := net.ListenTCP(s.proto, tcpaddr)
+	if err != nil {
+		log.Println("Failed to listen for tcp connections on address ", s.addr, " Error: ", err)
+		return err
+	}
+
+	for {
+		conn, err := ln.AcceptTCP()
+		if err != nil {
+			log.Println("Failed to accept connection ", conn, " due to error ", err)
+			continue
+		}
+		log.Println("Client ", conn.RemoteAddr(), " connected")
+		go s.handler(conn)
+	}
+	return nil
+}
+
+func TCPConnRead(c *net.TCPConn) error {
+	for {
+		n, err := c.Read(b)
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Client ", c.RemoteAddr(), " disconnected")
+				c.Close()
+				return nil
+			} else {
+				log.Println("Failed reading bytes from conn: ", c, " with error ", err)
+				c.Close()
+				return err
+			}
+		} else {
+			log.Println("Read ", n, " bytes from client ", c.RemoteAddr())
+		}
+	}
+	return nil
+}
+
+var b []byte
+
+func TCPConnWrite(c *net.TCPConn) error {
+	c.SetWriteBuffer(*packetsize)
+
+	for {
+		n, err := c.Write(b)
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Client ", c.RemoteAddr(), " disconnected")
+				c.Close()
+				return nil
+			} else {
+				log.Println("Failed writing bytes to conn: ", c, " with error ", err)
+				c.Close()
+				return err
+			}
+		} else {
+			log.Println("Wrote ", n, " bytes to connection ", c.LocalAddr())
+		}
+	}
+	log.Println("Came out of write loop! ", c)
+	return nil
+}
+
+var packetsize *int
+
+func SigIntHandler() {
+	ch := make(chan os.Signal)
+	signal.Notify(ch, syscall.SIGINT)
+	<-ch
+	log.Println("CTRL-C; exiting")
+	os.Exit(0)
+}
+
+func GoRuntimeStats() {
+	m := &runtime.MemStats{}
+	for {
+		time.Sleep(2 * time.Second)
+		log.Println("# goroutines: ", runtime.NumGoroutine())
+		runtime.ReadMemStats(m)
+		log.Println("Memory Acquired: ", humanize.Bytes(m.Sys))
+		log.Println("Memory Used    : ", humanize.Bytes(m.Alloc))
+		log.Println("# malloc       : ", m.Mallocs)
+		log.Println("# free         : ", m.Frees)
+		log.Println("GC enabled     : ", m.EnableGC)
+		log.Println("# GC           : ", m.NumGC)
+		log.Println("Last GC time   : ", m.LastGC)
+		log.Println("Next GC        : ", humanize.Bytes(m.NextGC))
+		//runtime.GC()
+	}
+}
+func doprofile(fn string) {
+	for i := 1; i > 0; i++ {
+		fc, err := os.Create(fn + "-cpu-" + strconv.Itoa(i) + ".prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		pprof.StartCPUProfile(fc)
+		time.Sleep(300 * time.Second)
+		pprof.StopCPUProfile()
+		fc.Close()
+
+		fh, err := os.Create(fn + "-heap-" + strconv.Itoa(i) + ".prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.WriteHeapProfile(fh)
+		fh.Close()
+
+		ft, err := os.Create(fn + "-threadcreate-" + strconv.Itoa(i) + ".prof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.Lookup("threadcreate").WriteTo(ft, 0)
+		ft.Close()
+		log.Println("Created CPU, heap and threadcreate profile of 300 seconds")
+	}
+}
+
+func main() {
+	host := flag.String("host", "127.0.0.1", "Host IP address")
+	port := flag.String("port", "12345", "Port")
+	// shost := flag.String("shost", "127.0.0.1", "Host IP address")
+	// sport := flag.String("sport", "0", "Port")
+	// listen := flag.Bool("listen", false, "Listen")
+	packetsize = flag.Int("size", 1500, "Size of packets to send")
+	// nconn := flag.Int("nconn", 254, "Number of concurrent connections")
+	// reqres := flag.Bool("reqres", false, "Request/Response protocol")
+	// nflight := flag.Int("nflight", 1024, "Number of requests in flight before waiting for response")
+	profile := flag.String("profile", "", "write profile to file with following prefix")
+	flag.Parse()
+
+	if *profile != "" {
+		go doprofile(*profile)
+	}
+	if flag.NArg() != 0 {
+		log.Println("Usage:")
+		flag.PrintDefaults()
+		return
+	}
+	b = make([]byte, *packetsize)
+	go GoRuntimeStats()
+
+	s := &Server{proto: "tcp", addr: net.JoinHostPort(*host, *port), handler: TCPConnWrite}
+	s.ListenAndGo()
+
+	log.Println("Finished execution!")
+}
